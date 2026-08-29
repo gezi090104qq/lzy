@@ -8,11 +8,10 @@
 	local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 	local CoreGui = game:GetService("CoreGui")
 	local ManualDictionary = {
-	    ["Home"] = "主页",
-                    ["Auto Join"] = "自动加入",
-                    ["UI Settings] = "界面设置",
-                    ["Farm"] = "任务设置",
-                    ["Webhook"] = "dc通知",
+	    ["Auto Join"] = "自动加入",
+	    ["UI Settings"] = "界面设置",
+	    ["Farm"] = "任务设置",
+	    ["Webhook"] = "dc通知",
 	    ["Theme..."] = "主题…",
 	    ["UI Scale"] = "界面缩放",
 	    ["Auto‑hide"] = "自动隐藏面板",
@@ -21,7 +20,6 @@
 	    ["Delete Saved Key"] = "删除已保存密钥",
 	    ["Auto Execute"] = "注入脚本后自动运行",
 	    ["Auto Rejoin"] = "自动重连服务器",
-	    ["UI Settings"] = "界面设置",
 	    ["Search..."] = "搜索…",
 	    ["Auto Farm"] = "自动刷怪挂机",
 	    ["Wait Before Farming"] = "开始刷取前等待延时",
@@ -34,7 +32,7 @@
 	    ["Farm Speed"] = "刷怪移动速度",
 	    ["Auto Retry"] = "自动重开对局",
 	    ["Auto Reload"] = "自动换刃/自动装填",
-	    ["Auto Skip Cutscenes"] = "自动跳过过场动画",
+	    ["Auto Skip Cutscenes"] = "自动跳转过场动画",
 	    ["Auto Return to Lobby"] = "自动返回大厅",
 	    ["Return Amount"] = "返回次数阈值",
 	    ["Lobby Failsafe (5 min)"] = "大厅安全保护（5分钟）",
@@ -98,12 +96,48 @@
 	    ["Auto Roll Family"] = "自动刷新家族",
 	    ["Stop Rolling On..."] = "刷新停止条件...",
 	}
+	-- ========== 短语替换表（下拉框组合文本）==========
+	local Phrases = {
+	    ["Select Modifiers"] = "选择任务词条",
+	    ["Select Map"] = "选择地图",
+	    ["Select Objective"] = "选择任务目标",
+	    ["Select Difficulty"] = "选择难度",
+	    ["No Perks"] = "禁用天赋",
+	    ["No Skills"] = "禁用技能",
+	    ["No Memories"] = "禁用记忆",
+	    ["Nightmare"] = "噩梦模式",
+	    ["Oddball"] = "异常巨人",
+	    ["Injury Prone"] = "易受伤",
+	    ["Chronic Injuries"] = "慢性损伤",
+	    ["Fog"] = "大雾",
+	    ["Glass Cannon"] = "玻璃大炮",
+	    ["Time Trial"] = "限时挑战",
+	}
 	local function translate(obj)
-	    if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
-	        local replacement = ManualDictionary[obj.Text]
-	        if replacement then
-	            obj.Text = replacement
+	    if not (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) then
+	        return
+	    end
+	    local raw = obj.Text
+	    if raw == "" then return end
+	    local t = raw:match("^%s*(.-)%s*$") or raw
+	    -- 第1步：精确匹配
+	    local replacement = ManualDictionary[t]
+	    if replacement then
+	        obj.Text = replacement
+	        return
+	    end
+	    -- 第2步：短语替换（下拉框组合文本）
+	    local result = t
+	    local changed = false
+	    for en, zh in pairs(Phrases) do
+	        local r = result:gsub(en, zh)
+	        if r ~= result then
+	            changed = true
+	            result = r
 	        end
+	    end
+	    if changed then
+	        obj.Text = result
 	    end
 	end
 	local function setupSilentTranslator(parent)
@@ -120,10 +154,10 @@
 	    end)
 	end
 	pcall(function() setupSilentTranslator(CoreGui) end)
-	setupSilentTranslator(PlayerGui)
+	pcall(function() setupSilentTranslator(PlayerGui) end)
 	PlayerGui.ChildAdded:Connect(function(child)
 	    if child:IsA("GuiObject") then
 	        setupSilentTranslator(child)
 	    end
 	end)
-	print("✅ 汉化已加载")
+	print("✅ 汉化已加载（含下拉框短语替换）")
