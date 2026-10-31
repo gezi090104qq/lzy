@@ -5,7 +5,58 @@ local UserInputService = game:GetService("UserInputService")
 local player = Players.LocalPlayer
 local isMobile = UserInputService.TouchEnabled
 
-local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+local function dshHttpGet(url)
+    local ok, body = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if ok and type(body) == "string" and #body > 1000 then
+        return body
+    end
+    local okReq, req = pcall(function()
+        if syn and syn.request then
+            return syn.request({ Url = url, Method = "GET" })
+        elseif http_request then
+            return http_request({ Url = url, Method = "GET" })
+        elseif request then
+            return request({ Url = url, Method = "GET" })
+        end
+    end)
+    if okReq and type(req) == "table" and type(req.Body) == "string" and #req.Body > 1000 then
+        return req.Body
+    end
+    return nil
+end
+
+local function dshLoadWindUI()
+    if type(loadstring) ~= "function" then
+        error("执行器缺少 loadstring，无法加载 WindUI")
+    end
+    local urls = {
+        "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua",
+        "https://raw.githubusercontent.com/Footagesus/WindUI/main/main.lua",
+    }
+    local body
+    for _, url in ipairs(urls) do
+        body = dshHttpGet(url)
+        if body then
+            break
+        end
+    end
+    if not body then
+        error("WindUI 下载失败：请检查执行器的 HTTP 权限（HttpGet / syn.request / http_request）")
+    end
+    local fn, err = loadstring(body)
+    if not fn then
+        error("WindUI 编译失败：" .. tostring(err))
+    end
+    local ok, ui = pcall(fn)
+    if not ok then
+        error("WindUI 初始化失败：" .. tostring(ui))
+    end
+    return ui
+end
+
+local WindUI = dshLoadWindUI()
 
 local Window = WindUI:CreateWindow({
     Title = "鸽子铺",
@@ -204,7 +255,9 @@ local dshStopMood
 local dshStopGhost
 local dshStopSoul
 local dshStopPlant
-local dshMobStop
+local dshStopCrystal
+local dshStopAura
+local dshStopBoss
 
 local hotkeySection = Tab:Section({ Title = "快捷按键", Opened = false })
 
@@ -234,7 +287,7 @@ local section = BasicsTab:Section({ Title = "基础", Opened = false })
 
 section:Button({
     Title = "一键停止所有活动",
-    Desc = "停止传送刷、敲门、开宝箱、蛋兑换、抓幽灵、龙心情、灵魂灯笼、自动打植物、自动攻击周围怪物等所有正在运行的功能，并把龙送回开始位置",
+    Desc = "停止传送刷、敲门、开宝箱、蛋兑换、抓幽灵、龙心情、灵魂灯笼、击碎南瓜/植物、击碎水晶、杀戮光环、自动打Boss 等所有正在运行的功能，并把龙送回开始位置",
     Callback = function()
         if dshStopAll then
             dshStopAll()
@@ -317,6 +370,9 @@ local function dshSetupDragonInfo()
             return true
         end
         local wrapper = cachedWrapper
+        if type(getgc) ~= "function" then
+            return false
+        end
         if not wrapper or (rawget(wrapper, "DragonModel") or rawget(wrapper, "Model")) ~= dragon then
             wrapper = nil
             for _, obj in ipairs(getgc(true)) do
@@ -867,8 +923,14 @@ dshStopAll = function()
     if dshStopPlant then
         dshStopPlant()
     end
-    if dshMobStop then
-        dshMobStop()
+    if dshStopCrystal then
+        dshStopCrystal()
+    end
+    if dshStopAura then
+        dshStopAura()
+    end
+    if dshStopBoss then
+        dshStopBoss()
     end
     farmNotify("已停止", "所有活动已停止，龙已回到原位")
 end
@@ -1611,6 +1673,7 @@ local eggState = {
 
 local EGG_KEY = "PossessedEgg"
 local EGG_COST = 150
+local EGG_COOLDOWN = 0
 
 local function eggEventData()
     local pg = player:FindFirstChild("PlayerGui")
@@ -1638,9 +1701,11 @@ local function eggStatusText()
     end
     local candy = ev:FindFirstChild("HalloweenCandy")
     return string.format(
-        "糖果：%s · Possessed Egg 2026：%d\nPossessed：%d 糖果/个 · 烈焰蛋：450 糖果 + 1 个万圣节蛋\n已兑换：%d 个 · 花费：%d 糖果",
+        "糖果：%s · 万圣节蛋：%d · 烈焰蛋：%d · 被诅咒蛋：%d\n万圣节蛋：%d 糖果/个 · 烈焰蛋：450 糖果 + 1 个万圣节蛋 · 被诅咒蛋：800 糖果 + 1 个烈焰蛋\n已兑换：%d 个 · 花费：%d 糖果",
         candy and tostring(candy.Value) or "?",
         eggCount(),
+        eggCountOf("BalefireEgg2026"),
+        eggCountOf("CursedEgg2026"),
         EGG_COST,
         eggState.exchanged,
         eggState.spent
@@ -1657,14 +1722,14 @@ local function eggRefresh()
     end)
 end
 
-local function eggExchangeOne(key, cost, label, reqEgg)
+local function eggExchangeOne(key, cost, label, reqEgg, reqLabel)
     key = key or EGG_KEY
     cost = cost or EGG_COST
     label = label or "Possessed Egg"
     local now = os.clock()
-    if now - eggState.lastClick < 3 then
+    if EGG_COOLDOWN > 0 and now - eggState.lastClick < EGG_COOLDOWN then
         pcall(function()
-            WindUI:Notify({ Title = "点太快了", Content = "每 3 秒只能兑换 1 个", Duration = 2 })
+            WindUI:Notify({ Title = "点太快了", Content = string.format("每 %d 秒只能兑换 1 个", EGG_COOLDOWN), Duration = 2 })
         end)
         return
     end
@@ -1688,7 +1753,7 @@ local function eggExchangeOne(key, cost, label, reqEgg)
     end
     if reqEgg and eggCountOf(reqEgg) < 1 then
         pcall(function()
-            WindUI:Notify({ Title = "缺少材料", Content = "烈焰蛋需要 1 个万圣节蛋（Possessed Egg 2026）", Duration = 3 })
+            WindUI:Notify({ Title = "缺少材料", Content = string.format("兑换 1 个 %s 需要 1 个 %s", label, reqLabel or reqEgg), Duration = 3 })
         end)
         return
     end
@@ -1731,7 +1796,7 @@ eggStatusPara = eggSection:Paragraph({
 
 eggSection:Button({
     Title = "兑换 1 个万圣节蛋",
-    Desc = string.format("点一次兑换 1 个 Possessed Egg 2026（%d 糖果），3 秒内只能点一次", EGG_COST),
+    Desc = string.format("点一次兑换 1 个 Possessed Egg 2026（%d 糖果），无间隔，可连续点击", EGG_COST),
     Callback = function()
         task.spawn(function()
             eggExchangeOne()
@@ -1741,10 +1806,20 @@ eggSection:Button({
 
 eggSection:Button({
     Title = "兑换 1 个烈焰蛋",
-    Desc = "点一次兑换 1 个 Balefire Egg 2026（450 糖果 + 1 个万圣节蛋），3 秒内只能点一次",
+    Desc = "点一次兑换 1 个 Balefire Egg 2026（450 糖果 + 1 个万圣节蛋），无间隔，可连续点击",
     Callback = function()
         task.spawn(function()
-            eggExchangeOne("BalefireEgg", 450, "烈焰蛋", "PossessedEgg2026")
+            eggExchangeOne("BalefireEgg", 450, "烈焰蛋", "PossessedEgg2026", "万圣节蛋")
+        end)
+    end,
+})
+
+eggSection:Button({
+    Title = "兑换 1 个被诅咒的蛋",
+    Desc = "点一次兑换 1 个 Cursed Egg 2026（800 糖果 + 1 个烈焰蛋），无间隔，可连续点击",
+    Callback = function()
+        task.spawn(function()
+            eggExchangeOne("CursedEgg", 800, "被诅咒的蛋", "BalefireEgg2026", "烈焰蛋")
         end)
     end,
 })
@@ -1755,7 +1830,10 @@ pcall(function()
         status = eggStatusText,
         exchange = eggExchangeOne,
         exchangeBalefire = function()
-            return eggExchangeOne("BalefireEgg", 450, "烈焰蛋", "PossessedEgg2026")
+            return eggExchangeOne("BalefireEgg", 450, "烈焰蛋", "PossessedEgg2026", "万圣节蛋")
+        end,
+        exchangeCursed = function()
+            return eggExchangeOne("CursedEgg", 800, "被诅咒的蛋", "BalefireEgg2026", "烈焰蛋")
         end,
         stop = dshStopEgg,
     }
@@ -2364,7 +2442,7 @@ local moodToggle
 local moodState = {
     running = false,
     generation = 0,
-    interval = 1,
+    interval = 0.3,
     action = "Bored",
     count = 0,
     statusClock = 0,
@@ -2497,16 +2575,6 @@ end
 
 dshStopMood = moodStop
 
-moodSection:Paragraph({
-    Title = "龙心情",
-    Desc = "发送 BondingExpRemote 的 “Bored” 抚摸动作，增加龙的羁绊/心情。需要先骑龙，并且处于可以互动的状态。",
-})
-
-moodStatusPara = moodSection:Paragraph({
-    Title = "心情状态",
-    Desc = "正在读取…",
-})
-
 moodToggle = moodSection:Toggle({
     Title = "自动长心情",
     Desc = "每隔一段时间发送一次抚摸动作",
@@ -2517,52 +2585,6 @@ moodToggle = moodSection:Toggle({
         else
             moodStop()
         end
-    end,
-})
-
-local function moodCreateSlider(parent, primaryConfig, fallbackConfig)
-    local ok, slider = pcall(function()
-        return parent:Slider(primaryConfig)
-    end)
-    if ok and slider then
-        return slider
-    end
-    local ok2, slider2 = pcall(function()
-        return parent:Slider(fallbackConfig)
-    end)
-    if ok2 then
-        return slider2
-    end
-    return nil
-end
-
-moodCreateSlider(moodSection, {
-    Title = "发送间隔（秒）",
-    Desc = "默认 1 秒",
-    Value = { Min = 0.3, Max = 5, Default = 1 },
-    Step = 0.1,
-    Callback = function(value)
-        moodState.interval = tonumber(value) or 1
-    end,
-}, {
-    Title = "发送间隔（秒）",
-    Desc = "默认 1 秒",
-    Value = 1,
-    Min = 0.3,
-    Max = 5,
-    Step = 0.1,
-    Callback = function(value)
-        moodState.interval = tonumber(value) or 1
-    end,
-})
-
-moodSection:Button({
-    Title = "长一次心情",
-    Desc = "手动发送一次抚摸动作",
-    Callback = function()
-        task.spawn(function()
-            moodFireOnce()
-        end)
     end,
 })
 
@@ -3371,8 +3393,6 @@ plantToggle = plantSection:Toggle({
     end,
 })
 
-HalloweenTab:Section({ Title = "击碎水晶", Opened = false })
-
 pcall(function()
     getgenv().DSH_Plant = {
         start = plantStart,
@@ -3389,189 +3409,2034 @@ end
 dshSetupPlant()
 
 ------------------------------------------------------------------
--- 自动攻击周围怪物（基础页）
+-- 击碎水晶（万圣节活动页，可折叠）
+-- 参考击碎南瓜：用 Destructibles 伤害事件；Heartbeat 每帧贴到水晶 Core 附近
 ------------------------------------------------------------------
 
-local function dshMobSetup()
-local mobToggle
-local mobState = {
-    running = false,
-    generation = 0,
-    attacked = 0,
-    current = "无",
-}
+local function dshSetupCrystal()
+    local crystalSection = HalloweenTab:Section({ Title = "击碎水晶", Opened = false })
 
-local function mobMover()
-    local char = player.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local dragon = hum and hum.SeatPart and hum.SeatPart.Parent
-    if dragon and dragon:IsA("Model") then
-        return dragon
-    end
-    local chars = workspace:FindFirstChild("Characters")
-    local me = chars and chars:FindFirstChild(player.Name)
-    local dragons = me and me:FindFirstChild("Dragons")
-    local first = dragons and dragons:GetChildren()[1]
-    if first and first:IsA("Model") then
-        return first
-    end
-    return char
-end
+    local crystalStatusPara
+    local crystalToggle
+    local RunService = game:GetService("RunService")
 
-local function mobNearest()
-    local folder = workspace:FindFirstChild("MobFolder")
-    local mover = mobMover()
-    local origin = mover and mover:GetPivot().Position or Vector3.zero
-    local best, bestDist
-    if folder then
-        for _, m in ipairs(folder:GetChildren()) do
-            local h = m:FindFirstChild("Health", true)
-            if h and h.Value > 0 then
-                local part = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
-                if part then
-                    local dist = (part.Position - origin).Magnitude
-                    if dist < 5000 and (not bestDist or dist < bestDist) then
-                        best, bestDist = m, dist
-                    end
+    local crystalState = {
+        running = false,
+        generation = 0,
+        interval = 0.3,
+        nextBite = 0,
+        hits = 0,
+        damage = 0,
+        startHealth = nil,
+        statusClock = 0,
+        conn = nil,
+        target = nil,
+        core = nil,
+        nextHit = 0,
+    }
+
+    local function crystalNotify(title, content)
+        pcall(function()
+            WindUI:Notify({
+                Title = title,
+                Content = content,
+                Duration = 3,
+            })
+        end)
+    end
+
+    local function crystalDragon()
+        local char = player.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local dragon = hum and hum.SeatPart and hum.SeatPart.Parent
+        if dragon and dragon:IsA("Model") then
+            return dragon
+        end
+        local chars = workspace:FindFirstChild("Characters")
+        local me = chars and chars:FindFirstChild(player.Name)
+        local dragons = me and me:FindFirstChild("Dragons")
+        local first = dragons and dragons:GetChildren()[1]
+        if first and first:IsA("Model") then
+            return first
+        end
+        return nil
+    end
+
+    local function crystalRemote()
+        local dragon = crystalDragon()
+        local remotes = dragon and dragon:FindFirstChild("Remotes")
+        return remotes and remotes:FindFirstChild("PlaySoundRemote")
+    end
+
+    local function crystalFind()
+        local interactions = workspace:FindFirstChild("Interactions")
+        local hall = interactions and interactions:FindFirstChild("HalloweenEvent")
+        local folder = hall and hall:FindFirstChild("BalefireCrystals")
+        if not folder then
+            return nil
+        end
+        for _, model in ipairs(folder:GetChildren()) do
+            if model:IsA("Model") then
+                local core = model:FindFirstChild("Core", true)
+                local health = core and core:FindFirstChild("Health")
+                local dead = core and core:FindFirstChild("Dead")
+                local hp = health and tonumber(health.Value)
+                if core and hp and hp > 0 and not (dead and dead.Value) then
+                    return { model = model, core = core, health = health }
                 end
             end
         end
+        return nil
     end
-    return best
-end
 
-local function mobStart()
-    if mobState.running then
-        return
-    end
-    mobState.running = true
-    mobState.target = nil
-    mobState.generation = mobState.generation + 1
-    local gen = mobState.generation
-    task.spawn(function()
-        while mobState.running and gen == mobState.generation do
-            local rev = getgenv().DSH_Revive
-            if rev and rev.dragon then
-                local dragon = rev.dragon()
-                if dragon then
-                    local hp = dragon:FindFirstChild("Health", true)
-                    local hpNum = hp and tonumber(hp.Value)
-                    local char = player.Character
-                    local hum = char and char:FindFirstChildOfClass("Humanoid")
-                    local seated = hum and hum.SeatPart ~= nil
-                    if hpNum ~= nil and hpNum <= 0 then
-                        if rev.once then
-                            pcall(rev.once)
-                        end
-                        task.wait(0.6)
-                        if rev.mount then
-                            pcall(rev.mount, dragon)
-                        end
-                    elseif not seated and rev.mount then
-                        pcall(rev.mount, dragon)
-                    end
+    local function crystalFindShard()
+        local interactions = workspace:FindFirstChild("Interactions")
+        local hall = interactions and interactions:FindFirstChild("HalloweenEvent")
+        local folder = hall and hall:FindFirstChild("BalefireCrystals")
+        local falling = folder and folder:FindFirstChild("FallingModels")
+        if not falling then
+            return nil
+        end
+        for _, model in ipairs(falling:GetChildren()) do
+            if model:IsA("Model") and string.find(string.lower(model.Name), "shard", 1, true) then
+                local main = model:FindFirstChild("Main", true)
+                local health = main and main:FindFirstChild("Health")
+                local dead = main and main:FindFirstChild("Dead")
+                local hp = health and tonumber(health.Value)
+                if main and hp and hp > 0 and not (dead and dead.Value) then
+                    return { model = model, core = main, health = health, shard = true }
                 end
             end
-            local mob = mobNearest()
-            if not mob then
-                mobState.target = nil
-                task.wait(2)
+        end
+        return nil
+    end
+
+    local function crystalStatusText()
+        local hp = crystalState.core and crystalState.core:FindFirstChild("Health")
+        local maxHealth = crystalState.core and crystalState.core:FindFirstChild("MaxHealth")
+        return string.format(
+            "%s · 水晶血量 %s / %s\n已出手 %d 次 · 本次伤害 %d\n位置：%s · 间隔 %.2f 秒",
+            crystalState.running and "击碎中" or "已停止",
+            hp and tostring(hp.Value) or "?",
+            maxHealth and tostring(maxHealth.Value) or "?",
+            crystalState.hits,
+            crystalState.damage,
+            crystalState.target and crystalState.target:GetFullName() or "无",
+            crystalState.interval
+        )
+    end
+
+    local function crystalUpdate(force)
+        if not crystalStatusPara then
+            return
+        end
+        local now = os.clock()
+        if not force and now - crystalState.statusClock < 0.5 then
+            return
+        end
+        crystalState.statusClock = now
+        pcall(function()
+            crystalStatusPara:SetDesc(crystalStatusText())
+        end)
+    end
+
+    local function crystalStop()
+        crystalState.running = false
+        crystalState.generation = crystalState.generation + 1
+        if crystalState.conn then
+            pcall(function()
+                crystalState.conn:Disconnect()
+            end)
+            crystalState.conn = nil
+        end
+        if crystalToggle then
+            pcall(function()
+                crystalToggle:Set(false, false)
+            end)
+        end
+        crystalUpdate(true)
+    end
+
+    dshStopCrystal = crystalStop
+
+    local function crystalEventActive()
+        local active = ReplicatedStorage:FindFirstChild("BalefireActiveValue")
+        local shards = ReplicatedStorage:FindFirstChild("BalefireShardsActiveValue")
+        if active and active.Value == true then
+            return true
+        end
+        if shards and tonumber(shards.Value) and tonumber(shards.Value) > 0 then
+            return true
+        end
+        return false
+    end
+
+    local function crystalTick()
+        if not crystalState.running then
+            return
+        end
+        if not crystalEventActive() then
+            crystalState.target = nil
+            crystalState.core = nil
+            return
+        end
+        local health = crystalState.core and crystalState.core:FindFirstChild("Health")
+        local hp = health and tonumber(health.Value)
+        if not (crystalState.core and hp and hp > 0) then
+            local found = crystalFind() or crystalFindShard()
+            if not found then
+                crystalUpdate(true)
+                return
+            end
+            crystalState.target = found.model
+            crystalState.core = found.core
+            crystalState.startHealth = tonumber(found.health.Value) or crystalState.startHealth
+            health = found.health
+            crystalUpdate(true)
+        end
+        local core = crystalState.core
+        local dragon = crystalDragon()
+        if not (core and dragon) then
+            return
+        end
+        local okPivot, pivot = pcall(function()
+            return dragon:GetPivot()
+        end)
+        if okPivot then
+            pcall(function()
+                dragon:PivotTo(CFrame.new(core.Position + Vector3.new(0, 12, 10)) * pivot.Rotation)
+            end)
+        end
+        local now = os.clock()
+        if now >= (crystalState.nextHit or 0) then
+            crystalState.nextHit = now + crystalState.interval
+            local remote = crystalRemote()
+            if remote then
+                pcall(function()
+                    remote:FireServer("Breath", "Destructibles", core)
+                end)
+                crystalState.hits = crystalState.hits + 1
+                if now >= (crystalState.nextBite or 0) then
+                    pcall(function()
+                        remote:FireServer("Bite", { { "Destructibles", core } })
+                    end)
+                    crystalState.nextBite = now + 4.2
+                    crystalState.hits = crystalState.hits + 1
+                end
+                local hpNow = health and tonumber(health.Value)
+                if hpNow and crystalState.startHealth then
+                    crystalState.damage = math.max(crystalState.startHealth - hpNow, 0)
+                end
+            end
+        end
+        crystalUpdate(false)
+    end
+
+    local function crystalStart()
+        if crystalState.running then
+            return
+        end
+        if not crystalDragon() then
+            crystalNotify("没有龙", "先骑上龙再击碎水晶")
+            if crystalToggle then
+                pcall(function()
+                    crystalToggle:Set(false, false)
+                end)
+            end
+            return
+        end
+        crystalState.running = true
+        crystalState.generation = crystalState.generation + 1
+        crystalState.hits = 0
+        crystalState.damage = 0
+        crystalState.nextHit = 0
+        crystalState.nextBite = 0
+        crystalState.target = nil
+        crystalState.core = nil
+        crystalState.conn = RunService.Heartbeat:Connect(crystalTick)
+        crystalUpdate(true)
+    end
+
+    crystalToggle = crystalSection:Toggle({
+        Title = "击碎水晶",
+        Value = false,
+        Callback = function(state)
+            if state then
+                crystalStart()
             else
-                local mover = mobMover()
-                local remotes = mover and mover:FindFirstChild("Remotes")
-                local breath = remotes and remotes:FindFirstChild("BreathFireRemote")
-                local part = mob.PrimaryPart or mob:FindFirstChildWhichIsA("BasePart")
-                if mover and breath and part then
-                    mobState.current = mob:GetFullName()
-                    if mobState.target ~= mob then
-                        mobState.target = mob
-                        local mp = mob:GetPivot()
-                        local above = mp.Position + Vector3.new(0, 10, 0)
-                        pcall(function()
-                            mover:PivotTo(CFrame.new(above))
-                        end)
-                        task.wait(0.9)
-                    end
-                    local cam = workspace.CurrentCamera
-                    local vimOk, vim = pcall(function()
-                        return game:GetService("VirtualInputManager")
-                    end)
-                    local sx, sy = 0, 0
-                    pcall(function()
-                        local screen = cam:WorldToViewportPoint(part.Position)
-                        sx, sy = math.floor(screen.X), math.floor(screen.Y)
-                    end)
-                    if vimOk and vim then
-                        pcall(function()
-                            vim:SendMouseMoveEvent(sx, sy, game)
-                        end)
-                        task.wait(0.05)
-                        pcall(function()
-                            vim:SendMouseButtonEvent(sx, sy, 0, true, game, 0)
-                        end)
-                    end
-                    pcall(function()
-                        breath:FireServer(true)
-                    end)
-                    task.wait(0.8)
-                    pcall(function()
-                        breath:FireServer(false)
-                    end)
-                    if vimOk and vim then
-                        pcall(function()
-                            vim:SendMouseButtonEvent(sx, sy, 0, false, game, 0)
-                        end)
-                    end
-                    mobState.attacked = mobState.attacked + 1
-                    task.wait(0.12)
-                else
-                    task.wait(1)
-                end
+                crystalStop()
             end
-        end
-        mobState.running = false
+        end,
+    })
+
+    pcall(function()
+        getgenv().DSH_Crystal = {
+            start = crystalStart,
+            stop = crystalStop,
+            find = crystalFind,
+            status = crystalStatusText,
+            state = crystalState,
+        }
+    end)
+
+    task.defer(function()
+        crystalUpdate(true)
     end)
 end
 
-local function mobStop()
-    mobState.running = false
-    mobState.generation = mobState.generation + 1
-    if mobToggle then
+dshSetupCrystal()
+
+------------------------------------------------------------------
+-- 杀戮光环（基础页，可折叠）
+-- 反编译结论：客户端伤害由 DragonClassClient 的 DamageRemote 发出，
+-- 该字段实际指向龙的 Remotes.PlaySoundRemote；打怪时参数是
+-- ("Breath"/"Bite", "Mobs", 怪物部件)。实测服务端约 0.25~0.3 秒结算
+-- 一次伤害；Bite 独立冷却约 4 秒、一次可带多个目标，所以做成
+-- 「每 0.3 秒打最近一只 + 每 4 秒一次群体撕咬」。
+------------------------------------------------------------------
+
+local function dshSetupKillAura()
+    local auraSection = BasicsTab:Section({ Title = "杀戮光环", Opened = false })
+
+    local auraStatusPara
+    local auraToggle
+    local auraDDC
+    local RunService = game:GetService("RunService")
+
+    local aura = {
+        running = false,
+        oneShot = false,
+        generation = 0,
+        range = 140,
+        interval = 0.3,
+        maxTargets = 4,
+        bite = true,
+        nextBite = 0,
+        hover = true,
+        hoverHeight = 12,
+        hoverExtra = 0,
+        hoverPart = nil,
+        hoverConn = nil,
+        bosses = true,
+        bossCache = {},
+        nextBossScan = 0,
+        bossCount = 0,
+        windows = false,
+        attacked = 0,
+        kills = 0,
+        targetCount = 0,
+        current = "无",
+        statusClock = 0,
+        lastHealth = {},
+    }
+
+    local function auraNotify(title, content)
         pcall(function()
-            mobToggle:Set(false, false)
+            WindUI:Notify({
+                Title = title,
+                Content = content,
+                Duration = 3,
+            })
         end)
     end
-end
 
-dshMobStop = mobStop
+    local function auraActive()
+        return aura.running or aura.oneShot
+    end
 
-mobToggle = section:Toggle({
-    Title = "自动攻击周围怪物",
-    Desc = "自动找附近的怪，传送过去吐息攻击，没怪时原地等待",
-    Value = false,
-    Callback = function(state)
-        if state then
-            mobStart()
-        else
-            mobStop()
+    local function auraDragon()
+        local char = player.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local dragon = hum and hum.SeatPart and hum.SeatPart.Parent
+        if dragon and dragon:IsA("Model") then
+            return dragon
         end
-    end,
-})
+        local chars = workspace:FindFirstChild("Characters")
+        local me = chars and chars:FindFirstChild(player.Name)
+        local dragons = me and me:FindFirstChild("Dragons")
+        local first = dragons and dragons:GetChildren()[1]
+        if first and first:IsA("Model") then
+            return first
+        end
+        return nil
+    end
 
-pcall(function()
-    getgenv().DSH_Mob = {
-        start = mobStart,
-        stop = mobStop,
-        state = mobState,
-        nearest = mobNearest,
-        mover = mobMover,
-    }
-end)
+    local function auraOrigin()
+        local dragon = auraDragon()
+        if dragon then
+            local ok, pivot = pcall(function()
+                return dragon:GetPivot()
+            end)
+            if ok then
+                return pivot.Position
+            end
+        end
+        local char = player.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        return root and root.Position or nil
+    end
 
+    local function auraRemote()
+        local dragon = auraDragon()
+        local remotes = dragon and dragon:FindFirstChild("Remotes")
+        return remotes and remotes:FindFirstChild("PlaySoundRemote")
+    end
 
+    local function auraHitbox(model)
+        local health = model:FindFirstChild("Health", true)
+        local parent = health and health.Parent
+        if parent and parent:IsA("BasePart") then
+            return parent, health
+        end
+        return model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart"), health
+    end
+
+    local function auraBossRefresh()
+        aura.bossCache = {}
+        if not aura.bosses or not auraDDC then
+            return
+        end
+        local chars = workspace:FindFirstChild("Characters")
+        for _, model in ipairs(workspace:GetDescendants()) do
+            if model:IsA("Model") then
+                local low = string.lower(model.Name)
+                local health = model:FindFirstChild("Health")
+                if not (health and health:IsA("ValueBase")) and string.find(low, "boss", 1, true) then
+                    health = model:FindFirstChild("Health", true)
+                end
+                if health and health:IsA("ValueBase") then
+                    local hp = tonumber(health.Value)
+                    if hp and hp > 0 and (hp >= 500 or string.find(low, "boss", 1, true)) then
+                        local insideChars = false
+                        local node = model
+                        while node do
+                            if node == chars then
+                                insideChars = true
+                                break
+                            end
+                            node = node.Parent
+                        end
+                        if not insideChars then
+                            local part = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+                            if part then
+                                local ok, entity = pcall(function()
+                                    return auraDDC.GetEntityFromHit(part, false)
+                                end)
+                                local entityType = ok and entity and entity.EntityType
+                                if entityType and string.find(entityType, "Boss") then
+                                    local topOffset = 0
+                                    local okBox, boxCFrame, boxSize = pcall(function()
+                                        return model:GetBoundingBox()
+                                    end)
+                                    if okBox and boxCFrame and boxSize then
+                                        topOffset = math.max((boxCFrame.Position.Y + boxSize.Y / 2) - part.Position.Y, 0)
+                                    end
+                                    aura.bossCache[model] = {
+                                        entityType = entityType,
+                                        root = entity.EntityRoot or part,
+                                        part = part,
+                                        health = health,
+                                        topOffset = topOffset,
+                                    }
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local function auraStage3()
+        local interactions = workspace:FindFirstChild("Interactions")
+        local hall = interactions and interactions:FindFirstChild("HalloweenEvent")
+        local pb = hall and hall:FindFirstChild("ParanoxBoss")
+        local eb = pb and pb:FindFirstChild("EventBoss")
+        local insts = eb and eb:FindFirstChild("BossInstances")
+        if not insts then
+            return false
+        end
+        for _, c in ipairs(insts:GetChildren()) do
+            local stage = c:FindFirstChild("Stage")
+            if stage and tonumber(stage.Value) and stage.Value >= 3 then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function auraScan()
+        local list = {}
+        local origin = auraOrigin()
+        if not origin then
+            aura.targetCount = 0
+            aura.bossCount = 0
+            return list
+        end
+        local seen = {}
+        local folder = workspace:FindFirstChild("MobFolder")
+        for _, model in ipairs(folder and folder:GetChildren() or {}) do
+            if model:IsA("Model") then
+                local part, health = auraHitbox(model)
+                local hp = health and tonumber(health.Value) or 0
+                local prev = aura.lastHealth[model]
+                if prev and prev > 0 and hp <= 0 then
+                    aura.kills = aura.kills + 1
+                end
+                aura.lastHealth[model] = hp
+                seen[model] = true
+                if part and hp > 0 then
+                    local dist = (part.Position - origin).Magnitude
+                    if dist <= aura.range then
+                        list[#list + 1] = {
+                            model = model,
+                            part = part,
+                            health = health,
+                            dist = dist,
+                            entityType = "Mobs",
+                            root = part,
+                        }
+                    end
+                end
+            end
+        end
+        local now = os.clock()
+        if now >= aura.nextBossScan then
+            auraBossRefresh()
+            aura.nextBossScan = now + 8
+        end
+        local bossCount = 0
+        for model, info in pairs(aura.bossCache) do
+            local hp = info.health and tonumber(info.health.Value) or 0
+            local prev = aura.lastHealth[model]
+            if prev and prev > 0 and hp <= 0 then
+                aura.kills = aura.kills + 1
+            end
+            aura.lastHealth[model] = hp
+            seen[model] = true
+            local part = info.part
+            if part and part.Parent and hp > 0 then
+                local dist = (part.Position - origin).Magnitude
+                if dist <= aura.range then
+                    bossCount = bossCount + 1
+                    list[#list + 1] = {
+                        model = model,
+                        part = part,
+                        health = info.health,
+                        dist = dist,
+                        entityType = info.entityType,
+                        root = info.root,
+                        hoverExtra = info.topOffset or 0,
+                    }
+                end
+            end
+        end
+        aura.bossCount = bossCount
+        local windowCount = 0
+        if aura.windows and auraStage3() then
+            local interactions = workspace:FindFirstChild("Interactions")
+            local hall = interactions and interactions:FindFirstChild("HalloweenEvent")
+            local pb = hall and hall:FindFirstChild("ParanoxBoss")
+            local eb = pb and pb:FindFirstChild("EventBoss")
+            local wins = eb and eb:FindFirstChild("BoardedWindows")
+            if wins then
+                for _, win in ipairs(wins:GetChildren()) do
+                    local hitbox = win:FindFirstChild("Hitbox", true)
+                    if hitbox then
+                        local fallen, total = 0, 0
+                        for _, c in ipairs(win:GetChildren()) do
+                            if c.Name == "Plank" then
+                                total = total + 1
+                                if c:GetAttribute("Fallen") == true then
+                                    fallen = fallen + 1
+                                end
+                            end
+                        end
+                        if total > 0 and fallen < total then
+                            local dist = (hitbox.Position - origin).Magnitude
+                            if dist <= aura.range then
+                                windowCount = windowCount + 1
+                                list[#list + 1] = {
+                                    model = win,
+                                    part = hitbox,
+                                    health = nil,
+                                    dist = dist,
+                                    entityType = "Destructibles",
+                                    root = hitbox,
+                                }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        aura.windowCount = windowCount
+        for model in pairs(aura.lastHealth) do
+            if not seen[model] then
+                aura.lastHealth[model] = nil
+            end
+        end
+        table.sort(list, function(a, b)
+            return a.dist < b.dist
+        end)
+        aura.targetCount = #list
+        return list
+    end
+
+    local function auraStatusText()
+        local biteText = "关"
+        if aura.bite then
+            local left = math.max(aura.nextBite - os.clock(), 0)
+            biteText = string.format("%.1f 秒后", left)
+        end
+        local hoverText = "关"
+        if aura.hover then
+            hoverText = string.format("%d 格", math.floor(aura.hoverHeight + 0.5))
+        end
+        return string.format(
+            "%s · 范围内目标 %d 个（Boss %d · 撕咬最多带 %d 个）\n范围 %d 格 · 每 %.2f 秒结算 · 悬浮：%s · 撕咬：%s\n已出手 %d 次 · 击杀 %d 个 · 当前：%s",
+            auraActive() and "运行中" or "已停止",
+            aura.targetCount,
+            aura.bossCount,
+            aura.maxTargets,
+            math.floor(aura.range + 0.5),
+            aura.interval,
+            hoverText,
+            biteText,
+            aura.attacked,
+            aura.kills,
+            aura.current
+        )
+    end
+
+    local function auraUpdateStatus(force)
+        if not auraStatusPara then
+            return
+        end
+        local now = os.clock()
+        if not force and now - aura.statusClock < 0.5 then
+            return
+        end
+        aura.statusClock = now
+        pcall(function()
+            auraStatusPara:SetDesc(auraStatusText())
+        end)
+    end
+
+    local function auraBreath(entry, remote)
+        local part = entry.part
+        if not (part and part.Parent) then
+            return false
+        end
+        local hp = entry.health and tonumber(entry.health.Value)
+        if hp ~= nil and hp <= 0 then
+            return false
+        end
+        local entityType = entry.entityType or "Mobs"
+        local root = entry.root or part
+        local ok = pcall(function()
+            remote:FireServer("Breath", entityType, root)
+        end)
+        aura.attacked = aura.attacked + 1
+        return ok
+    end
+
+    local function auraBite(targets, limit, remote)
+        if not aura.bite or os.clock() < aura.nextBite then
+            return 0
+        end
+        task.wait(0.05)
+        local batch = {}
+        for index = 1, limit do
+            local part = targets[index].part
+            if part and part.Parent then
+                batch[#batch + 1] = { targets[index].entityType or "Mobs", targets[index].root or part }
+            end
+        end
+        if #batch == 0 then
+            return 0
+        end
+        pcall(function()
+            remote:FireServer("Bite", batch)
+        end)
+        aura.attacked = aura.attacked + 1
+        aura.nextBite = os.clock() + 4.2
+        return #batch
+    end
+
+    pcall(function()
+        local rf = game:GetService("ReplicatedStorage"):FindFirstChild("_replicationFolder")
+        auraDDC = require(rf:FindFirstChild("DragonDamageClient"))
+    end)
+
+    local function auraHoverStop()
+        if aura.hoverConn then
+            pcall(function()
+                aura.hoverConn:Disconnect()
+            end)
+            aura.hoverConn = nil
+        end
+        aura.hoverPart = nil
+        aura.hoverExtra = 0
+    end
+
+    local function auraHoverStart()
+        auraHoverStop()
+        if not aura.hover then
+            return
+        end
+        aura.hoverConn = RunService.Heartbeat:Connect(function()
+            if not auraActive() then
+                return
+            end
+            local part = aura.hoverPart
+            local dragon = auraDragon()
+            if not (part and part.Parent and dragon) then
+                return
+            end
+            local height = math.max(aura.hoverHeight, 1) + (aura.hoverExtra or 0)
+            local pos = part.Position + Vector3.new(0, height, 0)
+            local ok, pivot = pcall(function()
+                return dragon:GetPivot()
+            end)
+            if not ok then
+                return
+            end
+            pcall(function()
+                dragon:PivotTo(CFrame.new(pos) * pivot.Rotation)
+            end)
+            local hrp = dragon:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                pcall(function()
+                    hrp.AssemblyLinearVelocity = Vector3.zero
+                    hrp.AssemblyAngularVelocity = Vector3.zero
+                end)
+            end
+        end)
+    end
+
+    local function auraRound()
+        local remote = auraRemote()
+        if not remote then
+            return 0
+        end
+        local targets = auraScan()
+        if #targets == 0 then
+            aura.hoverPart = nil
+            return 0
+        end
+        local limit = math.min(#targets, aura.maxTargets)
+        local focus = targets[1]
+        aura.hoverPart = focus.part
+        aura.hoverExtra = focus.hoverExtra or 0
+        aura.current = focus.model:GetFullName()
+        auraUpdateStatus(false)
+        local count = 0
+        if auraBreath(focus, remote) then
+            count = 1
+        end
+        auraBite(targets, limit, remote)
+        return count
+    end
+
+    local function auraStart()
+        if aura.running then
+            return
+        end
+        if dshStopBoss then
+            dshStopBoss()
+        end
+        if not auraDragon() then
+            if auraToggle then
+                pcall(function()
+                    auraToggle:Set(false, false)
+                end)
+            end
+            auraNotify("没有龙", "先骑上一条龙再开杀戮光环")
+            return
+        end
+        if not auraRemote() then
+            if auraToggle then
+                pcall(function()
+                    auraToggle:Set(false, false)
+                end)
+            end
+            auraNotify("找不到伤害事件", "龙的 Remotes.PlaySoundRemote 不存在，换个执行器重进")
+            return
+        end
+        local rev = getgenv().DSH_Revive
+        if rev and rev.ensure then
+            pcall(rev.ensure)
+        end
+        aura.running = true
+        aura.oneShot = false
+        aura.generation = aura.generation + 1
+        local gen = aura.generation
+        aura.lastHealth = {}
+        aura.bossCache = {}
+        aura.nextBossScan = 0
+        aura.nextBite = 0
+        auraHoverStart()
+        auraUpdateStatus(true)
+        task.spawn(function()
+            while aura.running and gen == aura.generation do
+                local count = auraRound()
+                if aura.running and gen == aura.generation then
+                    if count > 0 then
+                        task.wait(math.max(aura.interval, 0.25))
+                    else
+                        task.wait(1)
+                    end
+                end
+            end
+            aura.running = false
+            auraHoverStop()
+            if auraToggle then
+                pcall(function()
+                    auraToggle:Set(false, false)
+                end)
+            end
+            auraUpdateStatus(true)
+        end)
+    end
+
+    local function auraStop()
+        aura.running = false
+        aura.oneShot = false
+        aura.generation = aura.generation + 1
+        auraHoverStop()
+        if auraToggle then
+            pcall(function()
+                auraToggle:Set(false, false)
+            end)
+        end
+        auraUpdateStatus(true)
+    end
+
+    dshStopAura = auraStop
+
+    local function auraRunOnce()
+        if auraActive() then
+            auraNotify("正在运行", "先关闭杀戮光环再点清一圈")
+            return
+        end
+        if not auraRemote() then
+            auraNotify("找不到伤害事件", "先骑上龙再试")
+            return
+        end
+        aura.oneShot = true
+        aura.generation = aura.generation + 1
+        aura.lastHealth = {}
+        aura.bossCache = {}
+        aura.nextBossScan = 0
+        aura.nextBite = 0
+        auraHoverStart()
+        auraUpdateStatus(true)
+        task.spawn(function()
+            local count = auraRound()
+            aura.oneShot = false
+            auraHoverStop()
+            auraUpdateStatus(true)
+            auraNotify("清一圈完成", string.format("攻击了 %d 个目标", count))
+        end)
+    end
+
+    local function auraCreateSlider(parent, primaryConfig, fallbackConfig)
+        local ok, slider = pcall(function()
+            return parent:Slider(primaryConfig)
+        end)
+        if ok and slider then
+            return slider
+        end
+        local ok2, slider2 = pcall(function()
+            return parent:Slider(fallbackConfig)
+        end)
+        if ok2 then
+            return slider2
+        end
+        return nil
+    end
+
+    auraSection:Paragraph({
+        Title = "杀戮光环",
+        Desc = "反编译自客户端战斗模块（DragonClassClient / DragonDamageClient）：伤害走龙模型里的 Remotes.PlaySoundRemote，参数是（Breath/Bite、实体类型、实体部件）。实测服务端约 0.25~0.3 秒才结算一次伤害、有效距离约 150 格（Bite 更短），Bite 冷却约 4 秒且一次最多结算约 2 个目标，所以这里是「每 0.3 秒打最近一只 + 每 4 秒一次群体撕咬」。Boss（如 ParanoxBoss）会用解析出的实体类型一起算进来；伤害不模拟点击，悬浮由 Heartbeat 每帧把龙钉到目标头顶。",
+    })
+
+    auraStatusPara = auraSection:Paragraph({
+        Title = "光环状态",
+        Desc = "已停止 · 点击“开启杀戮光环”",
+    })
+
+    auraToggle = auraSection:Toggle({
+        Title = "开启杀戮光环",
+        Desc = "自动结算范围内怪物的伤害",
+        Value = false,
+        Callback = function(state)
+            if state then
+                auraStart()
+            else
+                auraStop()
+            end
+        end,
+    })
+
+    auraSection:Toggle({
+        Title = "悬浮在怪头顶",
+        Desc = "Heartbeat 每帧把龙钉在当前目标头顶，跟着怪移动；服务端可能会把位置拉回",
+        Value = true,
+        Callback = function(state)
+            aura.hover = state
+            if not state then
+                auraHoverStop()
+            elseif auraActive() then
+                auraHoverStart()
+            end
+        end,
+    })
+
+    auraCreateSlider(auraSection, {
+        Title = "悬浮高度（格）",
+        Desc = "龙在怪物头顶多高，默认 12",
+        Value = { Min = 3, Max = 40, Default = 12 },
+        Step = 1,
+        Callback = function(value)
+            aura.hoverHeight = tonumber(value) or 12
+        end,
+    }, {
+        Title = "悬浮高度（格）",
+        Desc = "龙在怪物头顶多高，默认 12",
+        Value = 12,
+        Min = 3,
+        Max = 40,
+        Step = 1,
+        Callback = function(value)
+            aura.hoverHeight = tonumber(value) or 12
+        end,
+    })
+
+    auraCreateSlider(auraSection, {
+        Title = "光环范围（格）",
+        Desc = "离自己多远内的怪会被打，默认 140；超过约 180 格服务端可能不结算",
+        Value = { Min = 20, Max = 2000, Default = 140 },
+        Step = 10,
+        Callback = function(value)
+            aura.range = tonumber(value) or 140
+        end,
+    }, {
+        Title = "光环范围（格）",
+        Desc = "离自己多远内的怪会被打，默认 140；超过约 180 格服务端可能不结算",
+        Value = 140,
+        Min = 20,
+        Max = 2000,
+        Step = 10,
+        Callback = function(value)
+            aura.range = tonumber(value) or 140
+        end,
+    })
+
+    auraCreateSlider(auraSection, {
+        Title = "结算间隔（秒）",
+        Desc = "服务端约 0.25~0.3 秒才结算一次，默认 0.3；调太小会被吞",
+        Value = { Min = 0.25, Max = 2, Default = 0.3 },
+        Step = 0.01,
+        Callback = function(value)
+            aura.interval = math.max(tonumber(value) or 0.3, 0.25)
+        end,
+    }, {
+        Title = "结算间隔（秒）",
+        Desc = "服务端约 0.25~0.3 秒才结算一次，默认 0.3；调太小会被吞",
+        Value = 0.3,
+        Min = 0.25,
+        Max = 2,
+        Step = 0.01,
+        Callback = function(value)
+            aura.interval = math.max(tonumber(value) or 0.3, 0.25)
+        end,
+    })
+
+    auraCreateSlider(auraSection, {
+        Title = "撕咬目标数",
+        Desc = "群体撕咬一次带几只怪，服务端目前只结算最近的约 2 只，默认 4",
+        Value = { Min = 1, Max = 20, Default = 4 },
+        Step = 1,
+        Callback = function(value)
+            aura.maxTargets = math.floor(tonumber(value) or 4)
+        end,
+    }, {
+        Title = "撕咬目标数",
+        Desc = "群体撕咬一次带几只怪，服务端目前只结算最近的约 2 只，默认 4",
+        Value = 4,
+        Min = 1,
+        Max = 20,
+        Step = 1,
+        Callback = function(value)
+            aura.maxTargets = math.floor(tonumber(value) or 4)
+        end,
+    })
+
+    auraSection:Toggle({
+        Title = "每 4 秒群体撕咬",
+        Desc = "独立冷却约 4 秒，一次对范围内多个目标结算，实测约 2 只",
+        Value = true,
+        Callback = function(state)
+            aura.bite = state
+        end,
+    })
+
+    auraSection:Toggle({
+        Title = "把 Boss 也算进来",
+        Desc = "自动扫描事件 Boss（如 ParanoxBoss），用 Boss 自己的实体类型结算；Boss 有减伤，每下伤害会低很多",
+        Value = true,
+        Callback = function(state)
+            aura.bosses = state
+            aura.bossCache = {}
+            aura.bossCount = 0
+            aura.nextBossScan = 0
+        end,
+    })
+
+    auraSection:Button({
+        Title = "清一圈",
+        Desc = "立刻打一次最近的怪（撕咬不在冷却时也会一起放）",
+        Callback = function()
+            auraRunOnce()
+        end,
+    })
+
+    auraSection:Toggle({
+        Title = "三阶段打窗户（无效，默认关）",
+        Desc = "实测 PlaySoundRemote 对窗户不掉血（3 次 Breath 0 变化），破窗请用自动打Boss 的真实点击+吐息",
+        Value = false,
+        Callback = function(state)
+            aura.windows = state
+        end,
+    })
+
+    auraSection:Button({
+        Title = "扫描一次 Boss",
+        Desc = "立即重新扫描事件 Boss，并提示当前缓存数量",
+        Callback = function()
+            aura.nextBossScan = 0
+            auraBossRefresh()
+            local count = 0
+            for _ in pairs(aura.bossCache) do
+                count = count + 1
+            end
+            auraUpdateStatus(true)
+            auraNotify("Boss 扫描完成", string.format("当前缓存 %d 个 Boss", count))
+        end,
+    })
+
+    auraSection:Button({
+        Title = "统计归零",
+        Desc = "清零出手次数和击杀数",
+        Callback = function()
+            aura.attacked = 0
+            aura.kills = 0
+            aura.lastHealth = {}
+            auraUpdateStatus(true)
+            auraNotify("已归零", "杀戮光环统计已清零")
+        end,
+    })
+
+    pcall(function()
+        getgenv().DSH_KillAura = {
+            start = auraStart,
+            stop = auraStop,
+            once = auraRunOnce,
+            scan = auraScan,
+            remote = auraRemote,
+            hover = auraHoverStart,
+            hoverStop = auraHoverStop,
+            refreshBoss = auraBossRefresh,
+            status = auraStatusText,
+            state = aura,
+        }
+    end)
+
+    task.defer(function()
+        auraUpdateStatus(true)
+    end)
 end
 
-dshMobSetup()
+dshSetupKillAura()
+
+------------------------------------------------------------------
+-- 自动打 Boss（万圣节活动页，可折叠）
+-- Boss 的实体类型用 DragonDamageClient.GetEntityFromHit 解析（ParanoxBoss 等），
+-- 伤害走龙的 Remotes.PlaySoundRemote；Boss 技能是服务端结算，站位只能减少中招。
+------------------------------------------------------------------
+
+local function dshSetupBossFight()
+    local bossSection = HalloweenTab:Section({ Title = "自动打Boss", Opened = false })
+
+    local bossStatusPara
+    local bossToggle
+    local RunService = game:GetService("RunService")
+
+    local fight = {
+        running = false,
+        generation = 0,
+        range = 120,
+        interval = 0.3,
+        hover = false,
+        hoverHeight = 30,
+        flank = true,
+        flankDistance = 40,
+        stage = nil,
+        dodge = true,
+        dodgeRange = 90,
+        dodgeDistance = 100,
+        dodgeSide = 1,
+        nextDodge = 0,
+        nextStrafe = 0,
+        dodgeUntil = 0,
+        dodgeCount = 0,
+        lastDodgeTag = nil,
+        entityType = nil,
+        nextWindowAttack = 0,
+        dodgeConn = nil,
+        breakWindows = true,
+        windowAttacks = 0,
+        bite = true,
+        nextBite = 0,
+        attacked = 0,
+        startHealth = nil,
+        lastHealth = nil,
+        maxHealth = nil,
+        bossName = "无",
+        current = "无",
+        statusClock = 0,
+        boss = nil,
+        root = nil,
+    }
+
+    local function bossNotify(title, content)
+        pcall(function()
+            WindUI:Notify({
+                Title = title,
+                Content = content,
+                Duration = 3,
+            })
+        end)
+    end
+
+    local function bossDragon()
+        local char = player.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local dragon = hum and hum.SeatPart and hum.SeatPart.Parent
+        if dragon and dragon:IsA("Model") then
+            return dragon
+        end
+        local chars = workspace:FindFirstChild("Characters")
+        local me = chars and chars:FindFirstChild(player.Name)
+        local dragons = me and me:FindFirstChild("Dragons")
+        local first = dragons and dragons:GetChildren()[1]
+        if first and first:IsA("Model") then
+            return first
+        end
+        return nil
+    end
+
+    local function bossRemote()
+        local dragon = bossDragon()
+        local remotes = dragon and dragon:FindFirstChild("Remotes")
+        return remotes and remotes:FindFirstChild("PlaySoundRemote")
+    end
+
+    local bossDDC
+    pcall(function()
+        local rf = game:GetService("ReplicatedStorage"):FindFirstChild("_replicationFolder")
+        bossDDC = require(rf and rf:FindFirstChild("DragonDamageClient"))
+    end)
+
+    local function bossFind()
+        local interactions = workspace:FindFirstChild("Interactions")
+        if not interactions then
+            return nil
+        end
+        local halloween = interactions:FindFirstChild("HalloweenEvent")
+        local paranox = halloween and halloween:FindFirstChild("ParanoxBoss")
+        local eventBoss = paranox and paranox:FindFirstChild("EventBoss")
+        local instances = eventBoss and eventBoss:FindFirstChild("BossInstances")
+        if instances then
+            for _, inst in ipairs(instances:GetChildren()) do
+                local model = inst:FindFirstChild("BossModel")
+                local health = model and model:FindFirstChild("Health")
+                local hp = health and health:IsA("ValueBase") and tonumber(health.Value)
+                if hp and hp > 0 then
+                    local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+                    if root then
+                        return {
+                            model = model,
+                            root = root,
+                            health = health,
+                            maxHealth = health:FindFirstChild("MaxHealth"),
+                        }
+                    end
+                end
+            end
+        end
+        for _, model in ipairs(interactions:GetDescendants()) do
+            if model:IsA("Model") and string.find(string.lower(model.Name), "boss", 1, true) then
+                local health = model:FindFirstChild("Health")
+                local hp = health and health:IsA("ValueBase") and tonumber(health.Value)
+                if hp and hp > 0 then
+                    local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+                    if root then
+                        return {
+                            model = model,
+                            root = root,
+                            health = health,
+                            maxHealth = health:FindFirstChild("MaxHealth"),
+                        }
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    local function bossEntity(entry)
+        if not (bossDDC and entry and entry.root) then
+            return nil
+        end
+        local ok, entity = pcall(function()
+            return bossDDC.GetEntityFromHit(entry.root, false)
+        end)
+        local entityType = ok and entity and entity.EntityType
+        if entityType then
+            return entityType, entity.EntityRoot or entry.root
+        end
+        return nil
+    end
+
+    local function bossStage(entry)
+        local inst = entry.model and entry.model.Parent
+        local stage = inst and inst:FindFirstChild("Stage")
+        return stage and tonumber(stage.Value) or nil
+    end
+
+    local function bossPlace(entry)
+        if os.clock() < (fight.dodgeUntil or 0) then
+            return
+        end
+        local dragon = bossDragon()
+        if not (dragon and entry.root) then
+            return
+        end
+        local rootPos = entry.root.Position
+        local okPivot, pivot = pcall(function()
+            return dragon:GetPivot()
+        end)
+        if not okPivot then
+            return
+        end
+        local stage = bossStage(entry)
+        fight.stage = stage
+        local target
+        if fight.flank and stage and stage >= 2 then
+            local forward
+            local head = entry.model:FindFirstChild("Head")
+            if head and head:IsA("BasePart") then
+                forward = Vector3.new(head.Position.X - rootPos.X, 0, head.Position.Z - rootPos.Z)
+            end
+            if not forward or forward.Magnitude < 1 then
+                local rootCF = entry.root.CFrame
+                forward = Vector3.new(rootCF.LookVector.X, 0, rootCF.LookVector.Z)
+            end
+            if forward.Magnitude < 0.05 then
+                forward = Vector3.new(0, 0, 1)
+            end
+            forward = forward.Unit
+            local behind = rootPos - forward * fight.flankDistance
+            target = CFrame.new(behind + Vector3.new(0, 8, 0)) * pivot.Rotation
+        elseif fight.hover then
+            local top = fight.hoverHeight
+            local okBox, boxCFrame, boxSize = pcall(function()
+                return entry.model:GetBoundingBox()
+            end)
+            if okBox and boxCFrame and boxSize then
+                top = top + math.max((boxCFrame.Position.Y + boxSize.Y / 2) - rootPos.Y, 0)
+            end
+            target = CFrame.new(rootPos + Vector3.new(0, top, 0)) * pivot.Rotation
+        else
+            local dpos = pivot.Position
+            local flat = Vector3.new(dpos.X - rootPos.X, 0, dpos.Z - rootPos.Z)
+            local dist = flat.Magnitude
+            local dir
+            if dist < 1 then
+                dir = Vector3.new(0, 0, 1)
+                dist = 1
+            else
+                dir = flat.Unit
+            end
+            if dist > fight.range + 5 then
+                target = CFrame.new(rootPos + dir * fight.range) * pivot.Rotation
+            elseif dist < fight.range * 0.55 then
+                target = CFrame.new(rootPos + dir * (fight.range * 0.8)) * pivot.Rotation
+            end
+        end
+        if target then
+            pcall(function()
+                dragon:PivotTo(target)
+            end)
+            local hrp = dragon:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                pcall(function()
+                    hrp.AssemblyLinearVelocity = Vector3.zero
+                    hrp.AssemblyAngularVelocity = Vector3.zero
+                end)
+            end
+        end
+    end
+
+    local function bossProjectiles()
+        local list = {}
+        local folder = workspace:FindFirstChild("ProjectileFolder")
+        if folder then
+            for _, c in ipairs(folder:GetChildren()) do
+                local part
+                if c:IsA("BasePart") then
+                    part = c
+                elseif c:IsA("Model") then
+                    part = c.PrimaryPart or c:FindFirstChildWhichIsA("BasePart")
+                end
+                if part then
+                    list[#list + 1] = part
+                end
+            end
+        end
+        for _, c in ipairs(workspace:GetChildren()) do
+            local low = string.lower(c.Name)
+            local hit = string.find(low, "fireball", 1, true) or string.find(low, "projectile", 1, true)
+            if hit then
+                local part
+                if c:IsA("BasePart") then
+                    part = c
+                elseif c:IsA("Model") then
+                    part = c.PrimaryPart or c:FindFirstChildWhichIsA("BasePart")
+                end
+                if part then
+                    list[#list + 1] = part
+                end
+            end
+        end
+        return list
+    end
+
+    local function bossDodgeUp()
+        local dragon = bossDragon()
+        if not dragon then
+            return
+        end
+        local ok, pivot = pcall(function()
+            return dragon:GetPivot()
+        end)
+        if not ok then
+            return
+        end
+        local target = Vector3.new(pivot.Position.X, (fight.root and fight.root.Parent and fight.root.Position.Y or pivot.Position.Y) + fight.dodgeDistance, pivot.Position.Z)
+        pcall(function()
+            dragon:PivotTo(CFrame.new(target) * pivot.Rotation)
+        end)
+        local hrp = dragon:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            pcall(function()
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.AssemblyAngularVelocity = Vector3.zero
+            end)
+        end
+        local now = os.clock()
+        fight.nextDodge = now + 0.8
+        fight.dodgeUntil = now + 0.6
+        fight.dodgeCount = fight.dodgeCount + 1
+    end
+
+    local function bossDodgeTick()
+        if not (fight.running and fight.dodge) then
+            return
+        end
+        local now = os.clock()
+        if now < fight.nextDodge then
+            return
+        end
+        local dragon = bossDragon()
+        if not dragon then
+            return
+        end
+        local ok, pivot = pcall(function()
+            return dragon:GetPivot()
+        end)
+        if not ok then
+            return
+        end
+        local dpos = pivot.Position
+        local cs = game:GetService("CollectionService")
+        local tagged = {}
+        for _, tag in ipairs({ "ParanoxBoss-Fireball", "ParanoxBoss-DeadlyFireball" }) do
+            for _, inst in ipairs(cs:GetTagged(tag)) do
+                tagged[#tagged + 1] = inst
+            end
+        end
+        if #tagged == 0 then
+            fight.lastDodgeTag = nil
+        else
+            for _, inst in ipairs(tagged) do
+                local pos
+                if inst:IsA("Attachment") then
+                    pos = inst.WorldPosition
+                elseif inst:IsA("BasePart") then
+                    pos = inst.Position
+                end
+                if pos and (pos - dpos).Magnitude <= fight.dodgeRange then
+                    local impact = tonumber(inst:GetAttribute("Impact"))
+                    local timeLeft = impact and (impact - workspace:GetServerTimeNow()) or nil
+                    if timeLeft and timeLeft > 0.5 then
+                        if now >= (fight.nextWindowAttack or 0) then
+                            local remote = bossRemote()
+                            local bossRoot = fight.root
+                            local bossType = fight.entityType or "ParanoxBoss"
+                            if remote and bossRoot and bossRoot.Parent then
+                                pcall(function()
+                                    remote:FireServer("Breath", bossType, bossRoot)
+                                end)
+                                pcall(function()
+                                    remote:FireServer("Bite", { { bossType, bossRoot } })
+                                end)
+                                fight.attacked = fight.attacked + 2
+                            end
+                            fight.nextWindowAttack = now + 0.3
+                        end
+                    elseif inst ~= fight.lastDodgeTag then
+                        fight.lastDodgeTag = inst
+                        local bossRoot = fight.root
+                        local bossType = fight.entityType or "ParanoxBoss"
+                        local remote = bossRemote()
+                        if remote and bossRoot and bossRoot.Parent then
+                            pcall(function()
+                                remote:FireServer("Breath", bossType, bossRoot)
+                            end)
+                            pcall(function()
+                                remote:FireServer("Bite", { { bossType, bossRoot } })
+                            end)
+                            fight.attacked = fight.attacked + 2
+                        end
+                        bossDodgeUp()
+                        return
+                    end
+                end
+            end
+        end
+        for _, c in ipairs(workspace.CurrentCamera:GetChildren()) do
+            if c:IsA("BasePart") then
+                local gui = c:FindFirstChild("BillboardGui")
+                if gui and (c.Position - dpos).Magnitude <= fight.dodgeRange then
+                    bossDodgeUp()
+                    return
+                end
+            end
+        end
+        local interactions = workspace:FindFirstChild("Interactions")
+        local hall = interactions and interactions:FindFirstChild("HalloweenEvent")
+        local pb = hall and hall:FindFirstChild("ParanoxBoss")
+        local eb = pb and pb:FindFirstChild("EventBoss")
+        local arena = eb and eb:FindFirstChild("Arena")
+        local zones = arena and arena:FindFirstChild("FireballZones")
+        if zones and #zones:GetChildren() > 0 then
+            bossDodgeUp()
+            return
+        end
+        for _, part in ipairs(bossProjectiles()) do
+            if part and part.Parent then
+                local delta = dpos - part.Position
+                local dist = delta.Magnitude
+                if dist <= fight.dodgeRange and dist > 1 then
+                    local vel = part.AssemblyLinearVelocity
+                    local incoming = (vel.Magnitude > 1 and vel:Dot(delta) > 0) or dist <= fight.dodgeRange * 0.4
+                    if incoming then
+                        bossDodgeUp()
+                        return
+                    end
+                end
+            end
+        end
+    end
+
+    local function bossDodgeStop()
+        if fight.dodgeConn then
+            pcall(function()
+                fight.dodgeConn:Disconnect()
+            end)
+            fight.dodgeConn = nil
+        end
+        fight.dodgeUntil = 0
+    end
+
+    local function bossDodgeStart()
+        bossDodgeStop()
+        fight.dodgeConn = RunService.Heartbeat:Connect(bossDodgeTick)
+    end
+
+    local function bossAttack(entry, entityType, remote)
+        local ok = pcall(function()
+            remote:FireServer("Breath", entityType, entry.root)
+        end)
+        fight.attacked = fight.attacked + 1
+        if fight.bite and os.clock() >= fight.nextBite then
+            task.wait(0.05)
+            pcall(function()
+                remote:FireServer("Bite", { { entityType, entry.root } })
+            end)
+            fight.attacked = fight.attacked + 1
+            fight.nextBite = os.clock() + 4.2
+        end
+        return ok
+    end
+
+    local function bossWindowFind()
+        local interactions = workspace:FindFirstChild("Interactions")
+        local hall = interactions and interactions:FindFirstChild("HalloweenEvent")
+        local pb = hall and hall:FindFirstChild("ParanoxBoss")
+        local eb = pb and pb:FindFirstChild("EventBoss")
+        local wins = eb and eb:FindFirstChild("BoardedWindows")
+        local dragon = bossDragon()
+        if not (wins and dragon) then
+            return nil
+        end
+        local origin = dragon:GetPivot().Position
+        local best
+        for _, win in ipairs(wins:GetChildren()) do
+            local hitbox = win:FindFirstChild("Hitbox", true)
+            if hitbox then
+                local fallen, total = 0, 0
+                for _, c in ipairs(win:GetChildren()) do
+                    if c.Name == "Plank" then
+                        total = total + 1
+                        if c:GetAttribute("Fallen") == true then
+                            fallen = fallen + 1
+                        end
+                    end
+                end
+                if total > 0 and fallen < total then
+                    local dist = (hitbox.Position - origin).Magnitude
+                    if not best or dist < best.dist then
+                        best = { win = win, hitbox = hitbox, dist = dist }
+                    end
+                end
+            end
+        end
+        return best
+    end
+
+    local function bossWindowAttack(entry)
+        if os.clock() < (fight.dodgeUntil or 0) then
+            return false
+        end
+        local dragon = bossDragon()
+        if not (dragon and entry and entry.hitbox) then
+            return false
+        end
+        local hitbox = entry.hitbox
+        local rem = dragon:FindFirstChild("Remotes")
+        local cam = workspace.CurrentCamera
+        local oldType, oldCFrame = cam.CameraType, cam.CFrame
+        pcall(function()
+            dragon:PivotTo(CFrame.lookAt(hitbox.Position + Vector3.new(0, 4, 12), hitbox.Position))
+        end)
+        task.wait(0.25)
+        pcall(function()
+            cam.CameraType = Enum.CameraType.Scriptable
+            cam.CFrame = CFrame.lookAt(hitbox.Position + Vector3.new(0, 6, 14), hitbox.Position)
+        end)
+        task.wait(0.15)
+        local screen = cam:WorldToViewportPoint(hitbox.Position)
+        local vim
+        pcall(function()
+            vim = game:GetService("VirtualInputManager")
+        end)
+        if vim then
+            pcall(function()
+                vim:SendMouseMoveEvent(math.floor(screen.X), math.floor(screen.Y), game)
+            end)
+            pcall(function()
+                vim:SendMouseButtonEvent(math.floor(screen.X), math.floor(screen.Y), 0, true, game, 0)
+            end)
+        end
+        local breath = rem and rem:FindFirstChild("BreathFireRemote")
+        if breath then
+            pcall(function()
+                breath:FireServer(true)
+            end)
+        end
+        local holdUntil = os.clock() + 1
+        while os.clock() < holdUntil do
+            if os.clock() < (fight.dodgeUntil or 0) then
+                break
+            end
+            task.wait(0.1)
+        end
+        if breath then
+            pcall(function()
+                breath:FireServer(false)
+            end)
+        end
+        if vim then
+            pcall(function()
+                vim:SendMouseButtonEvent(math.floor(screen.X), math.floor(screen.Y), 0, false, game, 0)
+            end)
+        end
+        pcall(function()
+            cam.CameraType = oldType
+            cam.CFrame = oldCFrame
+        end)
+        fight.windowAttacks = fight.windowAttacks + 1
+        return true
+    end
+
+    local function bossRound()
+        local entry = bossFind()
+        if not entry then
+            if fight.boss then
+                local health = fight.boss:FindFirstChild("Health")
+                local hp = health and tonumber(health.Value)
+                if (not fight.boss.Parent) or (hp ~= nil and hp <= 0) then
+                    fight.lastHealth = hp or 0
+                    fight.current = "已击杀"
+                end
+            end
+            if fight.current ~= "已击杀" then
+                fight.current = "无Boss"
+            end
+            return false
+        end
+        local dragon = bossDragon()
+        local remote = bossRemote()
+        if not (dragon and remote) then
+            return false
+        end
+        local entityType, entityRoot = bossEntity(entry)
+        if not entityType then
+            fight.current = "实体解析失败"
+            return false
+        end
+        entry.root = entityRoot or entry.root
+        fight.boss = entry.model
+        fight.root = entry.root
+        fight.bossName = entry.model:GetFullName()
+        fight.current = entityType
+        fight.entityType = entityType
+        fight.maxHealth = entry.maxHealth and tonumber(entry.maxHealth.Value) or nil
+        local hp = entry.health and tonumber(entry.health.Value)
+        if hp then
+            if fight.startHealth == nil then
+                fight.startHealth = hp
+            end
+            fight.lastHealth = hp
+        end
+        fight.stage = bossStage(entry)
+        if fight.breakWindows and fight.stage and fight.stage >= 3 then
+            local win = bossWindowFind()
+            if win then
+                fight.current = "窗户"
+                return bossWindowAttack(win)
+            end
+        end
+        bossPlace(entry)
+        bossAttack(entry, entityType, remote)
+        return true
+    end
+
+    local function bossDistance()
+        local dragon = bossDragon()
+        local root = fight.root
+        if dragon and root and root.Parent then
+            local ok, pivot = pcall(function()
+                return dragon:GetPivot()
+            end)
+            if ok then
+                return (pivot.Position - root.Position).Magnitude
+            end
+        end
+        return nil
+    end
+
+    local function bossStatusText()
+        local dist = bossDistance()
+        local dealt = 0
+        if fight.startHealth and fight.lastHealth then
+            dealt = math.max(fight.startHealth - fight.lastHealth, 0)
+        end
+        local biteText = "关"
+        if fight.bite then
+            biteText = string.format("%.1f 秒后", math.max(fight.nextBite - os.clock(), 0))
+        end
+        local stance
+        if fight.flank and fight.stage and fight.stage >= 2 then
+            stance = string.format("%s（阶段 %d）", fight.dodge and "绕后+躲弹" or "绕后", fight.stage)
+        elseif fight.hover then
+            stance = "悬停头顶"
+        else
+            stance = "保持距离"
+        end
+        return string.format(
+            "%s · Boss：%s（阶段 %s）\n血量 %s / %s · 距离 %s 格 · 出手 %d 次 · 本次伤害 %d · 闪避 %d 次 · 破窗 %d 次\n站位：%s · 撕咬：%s · 实体：%s",
+            fight.running and "打Boss中" or "已停止",
+            fight.bossName,
+            fight.stage and tostring(fight.stage) or "?",
+            fight.lastHealth and tostring(fight.lastHealth) or "?",
+            fight.maxHealth and tostring(fight.maxHealth) or "?",
+            dist and string.format("%.0f", dist) or "?",
+            fight.attacked,
+            dealt,
+            fight.dodgeCount,
+            fight.windowAttacks,
+            stance,
+            biteText,
+            fight.current
+        )
+    end
+
+    local function bossUpdate(force)
+        if not bossStatusPara then
+            return
+        end
+        local now = os.clock()
+        if not force and now - fight.statusClock < 0.5 then
+            return
+        end
+        fight.statusClock = now
+        pcall(function()
+            bossStatusPara:SetDesc(bossStatusText())
+        end)
+    end
+
+    local function bossStart()
+        if fight.running then
+            return
+        end
+        if dshStopAura then
+            dshStopAura()
+        end
+        if not bossDragon() then
+            if bossToggle then
+                pcall(function()
+                    bossToggle:Set(false, false)
+                end)
+            end
+            bossNotify("没有龙", "先骑上一条龙再打 Boss")
+            return
+        end
+        if not bossRemote() then
+            if bossToggle then
+                pcall(function()
+                    bossToggle:Set(false, false)
+                end)
+            end
+            bossNotify("找不到伤害事件", "龙的 Remotes.PlaySoundRemote 不存在")
+            return
+        end
+        local entry = bossFind()
+        if not entry then
+            if bossToggle then
+                pcall(function()
+                    bossToggle:Set(false, false)
+                end)
+            end
+            bossNotify("没有 Boss", "当前没有可打的 Boss")
+            return
+        end
+        fight.running = true
+        fight.generation = fight.generation + 1
+        local gen = fight.generation
+        fight.attacked = 0
+        fight.startHealth = nil
+        fight.lastHealth = nil
+        fight.nextBite = 0
+        fight.boss = entry.model
+        fight.root = entry.root
+        bossDodgeStart()
+        bossUpdate(true)
+        task.spawn(function()
+            local killed = false
+            while fight.running and gen == fight.generation do
+                local okRound = bossRound()
+                if not okRound then
+                    if fight.lastHealth ~= nil and fight.lastHealth <= 0 then
+                        killed = true
+                        break
+                    end
+                    task.wait(1)
+                elseif fight.lastHealth ~= nil and fight.lastHealth <= 0 then
+                    killed = true
+                    break
+                else
+                    task.wait(math.max(fight.interval, 0.25))
+                end
+            end
+            fight.running = false
+            bossDodgeStop()
+            if bossToggle then
+                pcall(function()
+                    bossToggle:Set(false, false)
+                end)
+            end
+            bossUpdate(true)
+            if killed then
+                bossNotify("Boss 已击杀", "自动打Boss 已停止")
+            end
+        end)
+    end
+
+    local function bossStop()
+        fight.running = false
+        fight.generation = fight.generation + 1
+        bossDodgeStop()
+        if bossToggle then
+            pcall(function()
+                bossToggle:Set(false, false)
+            end)
+        end
+        bossUpdate(true)
+    end
+
+    dshStopBoss = bossStop
+
+    local function bossCreateSlider(parent, primaryConfig, fallbackConfig)
+        local ok, slider = pcall(function()
+            return parent:Slider(primaryConfig)
+        end)
+        if ok and slider then
+            return slider
+        end
+        local ok2, slider2 = pcall(function()
+            return parent:Slider(fallbackConfig)
+        end)
+        if ok2 then
+            return slider2
+        end
+        return nil
+    end
+
+    bossSection:Paragraph({
+        Title = "自动打Boss",
+        Desc = "自动找万圣节活动 Boss（ParanoxBoss），用 DragonDamageClient 解析出的实体类型，通过龙的 PlaySoundRemote 结算伤害。默认保持 120 格距离，太远会靠过去、太近会退开；也可以改成悬停头顶。Boss 进入 Stage 2 后会自动绕到它背后（按头和根部的朝向判断）；所有阶段只要 Boss 开火（飞弹标签/FireballZones）都会立刻向上抬 100 格躲开，不横移；而且发现飞弹的瞬间会先打一套 Breath+Bite，再上移躲。Stage 3 会先用真实吐息+点击打碎窗户（每块木板 3 下），没有可破窗再回去打 Boss。注意 Boss 的 Fireball/Firewall 是服务端结算，站位和闪避只能减少中招，无法完全无伤。",
+    })
+
+    bossStatusPara = bossSection:Paragraph({
+        Title = "Boss 状态",
+        Desc = "已停止 · 点击“自动打Boss”开始",
+    })
+
+    bossToggle = bossSection:Toggle({
+        Title = "自动打Boss",
+        Desc = "自动攻击当前活动的 Boss（会先关掉杀戮光环）",
+        Value = false,
+        Callback = function(state)
+            if state then
+                bossStart()
+            else
+                bossStop()
+            end
+        end,
+    })
+
+    bossCreateSlider(bossSection, {
+        Title = "保持距离（格）",
+        Desc = "非悬停模式下和 Boss 保持的距离，默认 120；服务端有效伤害距离约 150",
+        Value = { Min = 20, Max = 150, Default = 120 },
+        Step = 5,
+        Callback = function(value)
+            fight.range = tonumber(value) or 120
+        end,
+    }, {
+        Title = "保持距离（格）",
+        Desc = "非悬停模式下和 Boss 保持的距离，默认 120；服务端有效伤害距离约 150",
+        Value = 120,
+        Min = 20,
+        Max = 150,
+        Step = 5,
+        Callback = function(value)
+            fight.range = tonumber(value) or 120
+        end,
+    })
+
+    bossCreateSlider(bossSection, {
+        Title = "结算间隔（秒）",
+        Desc = "服务端约 0.25~0.3 秒结算一次，默认 0.3",
+        Value = { Min = 0.25, Max = 2, Default = 0.3 },
+        Step = 0.01,
+        Callback = function(value)
+            fight.interval = math.max(tonumber(value) or 0.3, 0.25)
+        end,
+    }, {
+        Title = "结算间隔（秒）",
+        Desc = "服务端约 0.25~0.3 秒结算一次，默认 0.3",
+        Value = 0.3,
+        Min = 0.25,
+        Max = 2,
+        Step = 0.01,
+        Callback = function(value)
+            fight.interval = math.max(tonumber(value) or 0.3, 0.25)
+        end,
+    })
+
+    bossCreateSlider(bossSection, {
+        Title = "悬停高度（格）",
+        Desc = "开启悬停后龙停在 Boss 顶部再往上多少格，默认 30",
+        Value = { Min = 10, Max = 200, Default = 30 },
+        Step = 5,
+        Callback = function(value)
+            fight.hoverHeight = tonumber(value) or 30
+        end,
+    }, {
+        Title = "悬停高度（格）",
+        Desc = "开启悬停后龙停在 Boss 顶部再往上多少格，默认 30",
+        Value = 30,
+        Min = 10,
+        Max = 200,
+        Step = 5,
+        Callback = function(value)
+            fight.hoverHeight = tonumber(value) or 30
+        end,
+    })
+
+    bossSection:Toggle({
+        Title = "悬停 Boss 头顶",
+        Desc = "每帧把龙钉在 Boss 头顶，打得更稳但更容易吃技能",
+        Value = false,
+        Callback = function(state)
+            fight.hover = state
+        end,
+    })
+
+    bossSection:Toggle({
+        Title = "第二阶段绕后",
+        Desc = "Boss 进入 Stage 2 后自动绕到它背后打，躲正面的吐息/技能（优先于悬停）",
+        Value = true,
+        Callback = function(state)
+            fight.flank = state
+        end,
+    })
+
+    bossCreateSlider(bossSection, {
+        Title = "绕后距离（格）",
+        Desc = "绕到 Boss 背后多远，默认 40",
+        Value = { Min = 10, Max = 150, Default = 40 },
+        Step = 5,
+        Callback = function(value)
+            fight.flankDistance = tonumber(value) or 40
+        end,
+    }, {
+        Title = "绕后距离（格）",
+        Desc = "绕到 Boss 背后多远，默认 40",
+        Value = 40,
+        Min = 10,
+        Max = 150,
+        Step = 5,
+        Callback = function(value)
+            fight.flankDistance = tonumber(value) or 40
+        end,
+    })
+
+    bossSection:Toggle({
+        Title = "所有阶段躲飞弹",
+        Desc = "Boss 一开火（飞弹标签/FireballZones）就立刻向上抬 100 格躲开，不横移，也不管当前在破窗还是打 Boss；飞弹窗口会先打一套再躲",
+        Value = true,
+        Callback = function(state)
+            fight.dodge = state
+        end,
+    })
+
+    bossCreateSlider(bossSection, {
+        Title = "上移距离（格）",
+        Desc = "Boss 发飞弹时向上躲的高度，默认 100；太高会脱离输出距离",
+        Value = { Min = 20, Max = 300, Default = 100 },
+        Step = 10,
+        Callback = function(value)
+            fight.dodgeDistance = tonumber(value) or 100
+        end,
+    }, {
+        Title = "上移距离（格）",
+        Desc = "Boss 发飞弹时向上躲的高度，默认 100；太高会脱离输出距离",
+        Value = 100,
+        Min = 20,
+        Max = 300,
+        Step = 10,
+        Callback = function(value)
+            fight.dodgeDistance = tonumber(value) or 100
+        end,
+    })
+
+    bossSection:Toggle({
+        Title = "三阶段优先破窗",
+        Desc = "Stage 3 先用真实吐息+点击打碎场地窗户（每块木板 3 下），没有可破窗再打 Boss",
+        Value = true,
+        Callback = function(state)
+            fight.breakWindows = state
+        end,
+    })
+
+    bossSection:Toggle({
+        Title = "群体撕咬",
+        Desc = "每 4 秒补一次 Bite，实测对 Boss 也生效",
+        Value = true,
+        Callback = function(state)
+            fight.bite = state
+        end,
+    })
+
+    bossSection:Button({
+        Title = "扫描 Boss",
+        Desc = "立即检测当前 Boss 和解析出的实体类型",
+        Callback = function()
+            local entry = bossFind()
+            if not entry then
+                bossNotify("没有 Boss", "当前没有可打的 Boss")
+                return
+            end
+            local entityType = bossEntity(entry)
+            bossNotify("找到 Boss", string.format("%s（%s）血量 %s", entry.model.Name, tostring(entityType or "?"), tostring(entry.health.Value)))
+        end,
+    })
+
+    bossSection:Button({
+        Title = "统计归零",
+        Desc = "清零出手次数和本次伤害",
+        Callback = function()
+            fight.attacked = 0
+            fight.startHealth = nil
+            fight.lastHealth = nil
+            bossUpdate(true)
+        end,
+    })
+
+    pcall(function()
+        getgenv().DSH_Boss = {
+            start = bossStart,
+            stop = bossStop,
+            find = bossFind,
+            entity = bossEntity,
+            status = bossStatusText,
+            state = fight,
+        }
+    end)
+
+    task.spawn(function()
+        while true do
+            task.wait(1)
+            if fight.running then
+                bossUpdate(false)
+            end
+        end
+    end)
+
+    task.defer(function()
+        bossUpdate(true)
+    end)
+end
+
+dshSetupBossFight()
 
 ------------------------------------------------------------------
 -- 防 AFK（防止 20 分钟无操作被踢）
